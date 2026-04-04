@@ -25,7 +25,7 @@ import yaml
 # Default configuration
 DEFAULT_CONFIG = {
     "backup": {
-        "output_dir": "~/.openclaw/backups",
+        "output_dir": "~/backup",
         "verify_after": True,
         "include_workspace": True,
     },
@@ -35,10 +35,6 @@ DEFAULT_CONFIG = {
         "monthly": -1,  # -1 means keep indefinitely
     },
     "storage": {
-        "local": {
-            "enabled": True,
-            "path": "~/.openclaw/backups",
-        },
         "s3": {
             "enabled": False,
             "bucket": "",
@@ -158,7 +154,17 @@ class OpenClawBackup:
             return daily_path
 
         except subprocess.CalledProcessError as e:
-            self.logger.error("Backup failed: %s", e.stderr)
+            error_msg = e.stderr.strip()
+            self.logger.error("Backup failed: %s", error_msg)
+
+            # Provide helpful guidance for common errors
+            if "must not be written inside a source path" in error_msg:
+                self.logger.error("")
+                self.logger.error("The backup output directory cannot be inside the openclaw source directory.")
+                self.logger.error("Current output: %s", self.output_dir)
+                self.logger.error("Solution: Set output_dir to a location outside openclaw's directory")
+                self.logger.error("Example: ~/backup or /path/to/backups")
+
             return None
         except json.JSONDecodeError as e:
             self.logger.error("Failed to parse backup output: %s", e)
@@ -284,19 +290,19 @@ class OpenClawBackup:
                 self.delete_backup(oldest)
 
     def update_latest_symlink(self, latest: Path):
-        """Update 'latest' symlink to point to most recent backup."""
+        """Update 'latest.tar.gz' symlink to point to most recent backup."""
         if not self.config["options"].get("keep_latest_symlink", True):
             return
 
-        symlink_path = self.output_dir / "latest"
+        symlink_path = self.output_dir / "latest.tar.gz"
 
         try:
             if symlink_path.exists() or symlink_path.is_symlink():
                 symlink_path.unlink()
-            # Create relative symlink: latest → daily/filename.tar.gz
+            # Create relative symlink: latest.tar.gz → daily/filename.tar.gz
             relative_path = Path("daily") / latest.name
             symlink_path.symlink_to(relative_path)
-            self.logger.info("Updated symlink: latest → %s", relative_path)
+            self.logger.info("Updated symlink: latest.tar.gz → %s", relative_path)
         except OSError as e:
             self.logger.error("Failed to update symlink: %s", e)
 
@@ -331,14 +337,20 @@ class OpenClawBackup:
 def load_config(config_path: Optional[Path] = None) -> dict:
     """Load configuration from file or use defaults."""
     config = DEFAULT_CONFIG.copy()
-    
+
+    # Auto-discover config.yaml in current directory if no path specified
+    if config_path is None:
+        default_config = Path("config.yaml")
+        if default_config.exists():
+            config_path = default_config
+
     if config_path and config_path.exists():
         with open(config_path) as f:
             user_config = yaml.safe_load(f)
             if user_config:
                 # Deep merge would be better, but simple update works for now
                 config.update(user_config)
-    
+
     return config
 
 

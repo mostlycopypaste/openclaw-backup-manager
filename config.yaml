@@ -2,7 +2,7 @@
 
 backup:
   # Where to store backup archives
-  output_dir: ~/.openclaw/backups
+  output_dir: ~/Documents/Backups/openclaw/
   
   # Verify backup integrity after creation (uses openclaw backup verify)
   verify_after: true
@@ -21,10 +21,6 @@ retention:
   monthly: -1
 
 storage:
-  local:
-    enabled: true
-    path: ~/.openclaw/backups
-  
   s3:
     enabled: false
     bucket: ""
