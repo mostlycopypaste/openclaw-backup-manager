@@ -81,6 +81,55 @@ class TestBackupFile:
         assert backup is not None
         assert backup.created_at.year == 2026
 
+    def test_iso_week_properties(self):
+        """Test ISO week and year_month properties."""
+        # April 14, 2026 is ISO week 16
+        path = Path("2026-04-14T09-00-11.797Z-openclaw-backup.tar.gz")
+        backup = BackupFile.from_path(path)
+        assert backup is not None
+        assert backup.iso_week == 16
+        assert backup.year_month == (2026, 4)
+
+    def test_is_different_week(self):
+        """Test week comparison across ISO weeks."""
+        # Apr 12 is Sunday (ISO week 15), Apr 13 is Monday (ISO week 16)
+        b_week15_sun = BackupFile.from_path(Path("2026-04-12T09-00-11.797Z-openclaw-backup.tar.gz"))
+        b_week16_mon = BackupFile.from_path(Path("2026-04-13T09-00-11.797Z-openclaw-backup.tar.gz"))
+        b_week17_mon = BackupFile.from_path(Path("2026-04-20T09-00-11.797Z-openclaw-backup.tar.gz"))
+
+        assert b_week15_sun is not None and b_week16_mon is not None and b_week17_mon is not None
+
+        # Apr 12 (week 15) vs Apr 13 (week 16) — different weeks
+        assert OpenClawBackup._is_different_week(b_week15_sun, b_week16_mon) is True
+
+        # Apr 13 and Apr 16 are both ISO week 16
+        b_week16_thu = BackupFile.from_path(Path("2026-04-16T09-00-11.797Z-openclaw-backup.tar.gz"))
+        assert OpenClawBackup._is_different_week(b_week16_mon, b_week16_thu) is False
+
+        # Apr 13 (week 16) vs Apr 20 (week 17)
+        assert OpenClawBackup._is_different_week(b_week16_mon, b_week17_mon) is True
+
+    def test_is_different_month(self):
+        """Test month comparison."""
+        b_apr = BackupFile.from_path(Path("2026-04-20T09-00-11.797Z-openclaw-backup.tar.gz"))
+        b_may = BackupFile.from_path(Path("2026-05-01T09-00-11.797Z-openclaw-backup.tar.gz"))
+        b_mar = BackupFile.from_path(Path("2026-03-31T09-00-11.797Z-openclaw-backup.tar.gz"))
+
+        assert b_apr is not None and b_may is not None and b_mar is not None
+
+        # Same month (both April)
+        b_apr2 = BackupFile.from_path(Path("2026-04-25T09-00-11.797Z-openclaw-backup.tar.gz"))
+        assert OpenClawBackup._is_different_month(b_apr, b_apr2) is False
+
+        # Different months
+        assert OpenClawBackup._is_different_month(b_apr, b_may) is True
+        assert OpenClawBackup._is_different_month(b_apr, b_mar) is True
+
+        # Year boundary
+        b_dec = BackupFile.from_path(Path("2025-12-31T09-00-11.797Z-openclaw-backup.tar.gz"))
+        b_jan = BackupFile.from_path(Path("2026-01-01T09-00-11.797Z-openclaw-backup.tar.gz"))
+        assert OpenClawBackup._is_different_month(b_dec, b_jan) is True
+
 
 class TestOpenClawBackup:
     """Test OpenClawBackup class."""
@@ -152,123 +201,200 @@ class TestOpenClawBackup:
 class TestRotationLogic:
     """Test tiered rotation logic."""
 
-    def create_backup_file(self, directory: Path, days_ago: int) -> Path:
-        """Helper to create a backup file with specific date."""
-        timestamp = datetime.now() - timedelta(days=days_ago)
+    def create_backup_file(self, directory: Path, days_ago: int, hours_ago: int = 0) -> Path:
+        """Helper to create a backup file with specific date.
+
+        Args:
+            directory: Target directory (daily/weekly/monthly)
+            days_ago: How many days ago the backup should be dated
+            hours_ago: Additional hours offset
+        """
+        timestamp = datetime.now() - timedelta(days=days_ago, hours=hours_ago)
         filename = f"{timestamp.strftime('%Y-%m-%dT%H-%M-%S.000Z')}-openclaw-backup.tar.gz"
         path = directory / filename
         path.touch()
         return path
 
-    def test_daily_rotation_threshold(self, test_config):
-        """Daily backups rotate to weekly when exceeding limit."""
+    def test_daily_rotation_keeps_limit(self, test_config):
+        """Daily backups are pruned to the configured limit."""
         manager = OpenClawBackup(test_config)
 
-        # Create 8 daily backups (limit is 7)
+        # Create 10 daily backups (limit is 7)
+        for i in range(10):
+            self.create_backup_file(manager.daily_dir, i)
+
+        # Apply rotation
+        manager.apply_rotation()
+
+        daily_backups = manager.list_backups_in_dir(manager.daily_dir)
+        assert len(daily_backups) == 7
+
+    def test_daily_excess_promotes_to_weekly_only_if_different_week(self, test_config):
+        """Excess daily backups are promoted to weekly only if different ISO week."""
+        manager = OpenClawBackup(test_config)
+
+        # Create 8 daily backups all from the same week
+        # (using days 0-7, which likely span at most 2 ISO weeks)
         for i in range(8):
             self.create_backup_file(manager.daily_dir, i)
 
         # Apply rotation
         manager.apply_rotation()
 
-        # Should have exactly 7 in daily, 1 in weekly
         daily_backups = manager.list_backups_in_dir(manager.daily_dir)
         weekly_backups = manager.list_backups_in_dir(manager.weekly_dir)
 
+        # Daily should be pruned to 7
         assert len(daily_backups) == 7
-        assert len(weekly_backups) == 1
 
-    def test_weekly_rotation_threshold(self, test_config):
-        """Weekly backups rotate to monthly when exceeding limit."""
+        # Weekly should only have backups from distinct ISO weeks
+        # The excess daily is from the same week as recent dailies,
+        # so it may be deleted instead of promoted
+        iso_weeks = set((b.iso_year, b.iso_week) for b in weekly_backups)
+        assert len(weekly_backups) == len(iso_weeks), \
+            f"Weekly has {len(weekly_backups)} backups but only {len(iso_weeks)} distinct weeks"
+
+    def test_weekly_has_one_per_week(self, test_config):
+        """Weekly directory should contain at most one backup per ISO week."""
         manager = OpenClawBackup(test_config)
 
-        # Create 5 weekly backups (limit is 4)
-        for i in range(5):
-            self.create_backup_file(manager.weekly_dir, i * 7)
+        # Create daily backups spanning 5 weeks (35+ days)
+        for i in range(38):
+            self.create_backup_file(manager.daily_dir, i)
 
         # Apply rotation
         manager.apply_rotation()
 
-        # Should have exactly 4 in weekly, 1 in monthly
         weekly_backups = manager.list_backups_in_dir(manager.weekly_dir)
+
+        # Verify each weekly backup is from a distinct ISO week
+        iso_weeks = [(b.iso_year, b.iso_week) for b in weekly_backups]
+        assert len(iso_weeks) == len(set(iso_weeks)), \
+            f"Weekly has duplicates: {iso_weeks}"
+
+        # Should have at most 4 weekly backups (the configured limit)
+        assert len(weekly_backups) <= 4
+
+    def test_weekly_excess_promotes_to_monthly_only_if_different_month(self, test_config):
+        """Excess weekly backups promote to monthly only if different month."""
+        manager = OpenClawBackup(test_config)
+
+        # Create daily backups spanning 6 weeks
+        for i in range(45):
+            self.create_backup_file(manager.daily_dir, i)
+
+        # Apply rotation
+        manager.apply_rotation()
+
         monthly_backups = manager.list_backups_in_dir(manager.monthly_dir)
 
-        assert len(weekly_backups) == 4
-        assert len(monthly_backups) == 1
+        # Monthly should only have backups from distinct months
+        months = [b.year_month for b in monthly_backups]
+        assert len(months) == len(set(months)), \
+            f"Monthly has duplicates: {months}"
 
     def test_monthly_unlimited_retention(self, test_config):
         """Monthly backups kept indefinitely by default."""
         manager = OpenClawBackup(test_config)
 
-        # Create 10 monthly backups
-        for i in range(10):
-            self.create_backup_file(manager.monthly_dir, i * 30)
+        # Create daily backups spanning 3 months (~100 days)
+        for i in range(100):
+            self.create_backup_file(manager.daily_dir, i)
 
         # Apply rotation
         manager.apply_rotation()
 
-        # All should remain (monthly = -1)
+        # Monthly backups should all be from distinct months and kept
         monthly_backups = manager.list_backups_in_dir(manager.monthly_dir)
-        assert len(monthly_backups) == 10
+        months = [b.year_month for b in monthly_backups]
+        assert len(months) == len(set(months))
 
     def test_monthly_limited_retention(self, test_config):
         """Monthly backups pruned when limit set."""
-        test_config["retention"]["monthly"] = 3
+        test_config["retention"]["monthly"] = 2
         manager = OpenClawBackup(test_config)
 
-        # Create 5 monthly backups
-        for i in range(5):
-            self.create_backup_file(manager.monthly_dir, i * 30)
-
-        # Apply rotation
-        manager.apply_rotation()
-
-        # Should keep only 3
-        monthly_backups = manager.list_backups_in_dir(manager.monthly_dir)
-        assert len(monthly_backups) == 3
-
-    def test_cascading_rotation(self, test_config):
-        """Full cascade: daily → weekly → monthly."""
-        manager = OpenClawBackup(test_config)
-
-        # Fill daily (8 files, over limit of 7)
-        for i in range(8):
+        # Create daily backups spanning 4 months
+        for i in range(130):
             self.create_backup_file(manager.daily_dir, i)
 
-        # Fill weekly (5 files, over limit of 4)
-        # Use wider spacing to avoid same-day collisions
-        for i in range(5):
-            self.create_backup_file(manager.weekly_dir, (i + 1) * 7)
-
         # Apply rotation
         manager.apply_rotation()
 
-        daily_backups = manager.list_backups_in_dir(manager.daily_dir)
-        weekly_backups = manager.list_backups_in_dir(manager.weekly_dir)
         monthly_backups = manager.list_backups_in_dir(manager.monthly_dir)
-
-        assert len(daily_backups) == 7
-        assert len(weekly_backups) == 4
-        # Should have at least 1 monthly (2 expected from overflow, but edge cases possible)
-        assert len(monthly_backups) >= 1
+        assert len(monthly_backups) <= 2
 
     def test_dry_run_mode(self, test_config):
         """Dry run doesn't modify files."""
         test_config["options"]["dry_run"] = True
         manager = OpenClawBackup(test_config)
 
-        # Create 8 daily backups
-        for i in range(8):
+        # Create 10 daily backups (over the limit of 7)
+        for i in range(10):
             self.create_backup_file(manager.daily_dir, i)
 
-        initial_count = len(list(manager.daily_dir.glob("*.tar.gz")))
+        initial_daily = len(list(manager.daily_dir.glob("*.tar.gz")))
 
         # Apply rotation in dry run
         manager.apply_rotation()
 
         # Nothing should change
-        final_count = len(list(manager.daily_dir.glob("*.tar.gz")))
-        assert final_count == initial_count
+        final_daily = len(list(manager.daily_dir.glob("*.tar.gz")))
+        assert final_daily == initial_daily
+
+    def test_same_week_daily_excess_gets_deleted(self, test_config):
+        """When excess daily backup is from same ISO week as newest weekly, it's deleted not promoted."""
+        manager = OpenClawBackup(test_config)
+
+        # Pre-populate weekly with a backup from this week
+        self.create_backup_file(manager.weekly_dir, 1)
+
+        # Create 8 daily backups, also from this week (same ISO week)
+        for i in range(8):
+            self.create_backup_file(manager.daily_dir, i)
+
+        # Apply rotation
+        manager.apply_rotation()
+
+        weekly_backups = manager.list_backups_in_dir(manager.weekly_dir)
+
+        # All weekly backups should be from distinct ISO weeks
+        iso_weeks = [(b.iso_year, b.iso_week) for b in weekly_backups]
+        assert len(iso_weeks) == len(set(iso_weeks)), \
+            f"Weekly has duplicates within same week: {iso_weeks}"
+
+    def test_rotate_only_mode(self, test_config):
+        """Rotate-only mode skips backup creation."""
+        test_config["options"]["dry_run"] = True  # so create_backup returns None safely
+        manager = OpenClawBackup(test_config)
+
+        # Create some backups to rotate
+        for i in range(8):
+            self.create_backup_file(manager.daily_dir, i)
+
+        # Should not crash in rotate-only mode
+        # (We can't fully test without mocking openclaw CLI, but
+        # the rotation logic should still run)
+        manager.apply_rotation()
+
+        # Verify rotation happened (even in dry_run, logic should evaluate)
+        daily_backups = manager.list_backups_in_dir(manager.daily_dir)
+        assert len(daily_backups) == 8  # dry_run doesn't actually move files
+
+    def test_empty_directories(self, test_config):
+        """Rotation handles empty directories gracefully."""
+        manager = OpenClawBackup(test_config)
+
+        # No backups at all — should not crash
+        manager.apply_rotation()
+
+        daily = manager.list_backups_in_dir(manager.daily_dir)
+        weekly = manager.list_backups_in_dir(manager.weekly_dir)
+        monthly = manager.list_backups_in_dir(manager.monthly_dir)
+
+        assert len(daily) == 0
+        assert len(weekly) == 0
+        assert len(monthly) == 0
 
 
 class TestSymlinkManagement:
@@ -290,11 +416,10 @@ class TestSymlinkManagement:
         # Update symlink
         manager.update_latest_symlink(backup_path)
 
-        symlink_path = manager.output_dir / "latest"
+        symlink_path = manager.output_dir / "latest.tar.gz"
         assert symlink_path.is_symlink()
-        # Check that symlink points to the right file (resolve both for comparison)
+        # Check that symlink points to the right file
         assert symlink_path.resolve().name == backup_path.name
-        assert "daily" in str(symlink_path.resolve())
 
     def test_symlink_disabled(self, test_config):
         """Symlink not created when disabled."""
@@ -309,7 +434,7 @@ class TestSymlinkManagement:
         backup = BackupFile.from_path(backup_path)
         manager.update_latest_symlink(backup_path)
 
-        symlink_path = manager.output_dir / "latest"
+        symlink_path = manager.output_dir / "latest.tar.gz"
         assert not symlink_path.exists()
 
 

@@ -4,8 +4,8 @@ OpenClaw Backup Manager
 
 Automated backup with tiered retention:
 - Keep last 7 daily backups
-- Keep 1 per week for past 4 weeks
-- Keep 1 per month indefinitely
+- Keep 1 per week for past N weeks (default 4)
+- Keep 1 per month indefinitely (or N months)
 """
 
 import argparse
@@ -78,6 +78,21 @@ class BackupFile:
         except ValueError:
             return None
 
+    @property
+    def iso_year(self) -> int:
+        """ISO calendar year for this backup's date."""
+        return self.created_at.isocalendar()[0]
+
+    @property
+    def iso_week(self) -> int:
+        """ISO week number for this backup's date."""
+        return self.created_at.isocalendar()[1]
+
+    @property
+    def year_month(self) -> tuple:
+        """(year, month) tuple for this backup's date."""
+        return (self.created_at.year, self.created_at.month)
+
 
 class OpenClawBackup:
     """Manages OpenClaw backup creation and retention."""
@@ -86,6 +101,9 @@ class OpenClawBackup:
         self.config = config
         self.output_dir = Path(config["backup"]["output_dir"]).expanduser()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Get openclaw path from config, default to 'openclaw' in PATH
+        self.openclaw_path = config.get("openclaw_path", "openclaw")
 
         # Create tiered subdirectories
         self.daily_dir = self.output_dir / "daily"
@@ -113,7 +131,7 @@ class OpenClawBackup:
         self.logger.info("Starting backup creation...")
 
         cmd = [
-            "openclaw", "backup", "create",
+            self.openclaw_path, "backup", "create",
             "--output", str(self.output_dir),
             "--json",
         ]
@@ -173,20 +191,20 @@ class OpenClawBackup:
     def verify_backup(self, archive_path: Path) -> bool:
         """Verify a backup archive."""
         self.logger.info("Verifying backup: %s", archive_path)
-        
+
         cmd = [
-            "openclaw", "backup", "verify",
+            self.openclaw_path, "backup", "verify",
             str(archive_path),
             "--json",
         ]
-        
+
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             output = json.loads(result.stdout)
             # Verify command outputs validation result
             self.logger.info("Backup verification passed")
             return True
-            
+
         except subprocess.CalledProcessError as e:
             self.logger.error("Backup verification failed: %s", e.stderr)
             return False
@@ -240,15 +258,82 @@ class OpenClawBackup:
             self.logger.error("Failed to delete %s: %s", backup.path, e)
             return False
 
+    @staticmethod
+    def _is_different_week(backup: BackupFile, reference: BackupFile) -> bool:
+        """Check if backup is from a different ISO week than reference.
+
+        Compares both ISO year and week number to handle year boundaries correctly.
+        """
+        return (backup.iso_year, backup.iso_week) != (reference.iso_year, reference.iso_week)
+
+    @staticmethod
+    def _is_different_month(backup: BackupFile, reference: BackupFile) -> bool:
+        """Check if backup is from a different calendar month than reference.
+
+        Compares both year and month to handle year boundaries correctly.
+        """
+        return backup.year_month != reference.year_month
+
+    def _consolidate_tier(self, backups: List[BackupFile], key_fn, dest_dir: Path = None) -> List[BackupFile]:
+        """Remove duplicates within a tier, keeping the newest per key.
+
+        For each group of backups sharing the same key (ISO week or month),
+        keep only the most recent backup. Older duplicates are either
+        promoted to the next tier (if dest_dir is provided and they represent
+        a new key there) or deleted.
+
+        Args:
+            backups: List of backups in this tier (sorted oldest-first)
+            key_fn: Function to extract the grouping key (e.g., iso_week tuple)
+            dest_dir: Destination directory for promoting duplicates (None = delete)
+
+        Returns:
+            List of remaining backups (deduplicated) with newest per key.
+        """
+        if not backups:
+            return backups
+
+        # Group by key, keeping track of all backups per group
+        groups: Dict[tuple, List[BackupFile]] = {}
+        for backup in backups:
+            key = key_fn(backup)
+            if key not in groups:
+                groups[key] = []
+            groups[key].append(backup)
+
+        # For each group with more than one backup, keep the newest,
+        # delete or promote the rest
+        remaining = []
+        for key, group_backups in groups.items():
+            # group_backups is sorted oldest-first (inherited from input)
+            # Keep the newest (last), process the rest
+            for backup in group_backups[:-1]:
+                self.logger.info(
+                    "Consolidating duplicate in %s: %s (keeping newer %s)",
+                    backup.path.parent.name, backup.path.name,
+                    group_backups[-1].path.name,
+                )
+                self.delete_backup(backup)
+            remaining.append(group_backups[-1])  # keep newest per key
+
+        # Sort remaining by date
+        remaining.sort(key=lambda b: b.created_at)
+        return remaining
+
     def apply_rotation(self):
         """
-        Apply tiered rotation policy with directory-based tiers.
+        Apply tiered rotation policy with week/month-aware promotion.
 
         Rotation logic:
-        1. New backup created in daily/
-        2. If daily/ has > 7 files, move oldest to weekly/
-        3. If weekly/ has > 4 files, move oldest to monthly/
-        4. Apply monthly retention (delete excess if configured)
+        1. Consolidate weekly tier: keep only 1 backup per ISO week (newest wins).
+        2. Consolidate monthly tier: keep only 1 backup per calendar month (newest wins).
+        3. Daily rotation: keep the newest N daily backups. Excess backups that
+           represent a new ISO week get promoted to weekly; same-week excess
+           is deleted.
+        4. Weekly rotation: if over the weekly limit, remove oldest. Before
+           deleting, check if it represents a different month than the newest
+           monthly — if so, promote to monthly.
+        5. Monthly retention: keep indefinitely (or N months if configured).
         """
         retention = self.config["retention"]
         daily_limit = retention.get("daily", 7)
@@ -267,27 +352,95 @@ class OpenClawBackup:
         self.logger.info("Current state: daily=%d, weekly=%d, monthly=%d",
                         len(daily_backups), len(weekly_backups), len(monthly_backups))
 
-        # Rotate daily → weekly if over limit
-        while len(daily_backups) > daily_limit:
-            oldest = daily_backups.pop(0)
-            self.move_backup(oldest, self.weekly_dir)
+        # --- Step 0: Consolidate existing tiers ---
+        # Fix any pre-existing duplicates within weekly (keep 1 per ISO week)
+        # and monthly (keep 1 per calendar month)
+        weekly_backups = self._consolidate_tier(
+            weekly_backups,
+            key_fn=lambda b: (b.iso_year, b.iso_week),
+        )
+        monthly_backups = self._consolidate_tier(
+            monthly_backups,
+            key_fn=lambda b: b.year_month,
+        )
 
-        # Re-scan weekly after daily rotation
+        # --- Step 1: Daily rotation ---
+        # Keep the newest N daily backups. For excess daily backups, try to
+        # promote to weekly if they represent a new week; otherwise delete.
+        while len(daily_backups) > daily_limit:
+            oldest_daily = daily_backups.pop(0)  # oldest (sorted oldest-first)
+
+            # Should we promote this to weekly?
+            promote_to_weekly = True
+            if weekly_backups:
+                # Only promote if this backup is from a different ISO week
+                # than the most recent weekly backup
+                newest_weekly = weekly_backups[-1]  # newest (sorted oldest-first)
+                if not self._is_different_week(oldest_daily, newest_weekly):
+                    self.logger.info(
+                        "Daily backup %s is same ISO week (%d-%02d) as newest weekly %s — deleting instead of promoting",
+                        oldest_daily.path.name,
+                        oldest_daily.iso_year, oldest_daily.iso_week,
+                        newest_weekly.path.name,
+                    )
+                    promote_to_weekly = False
+
+            if promote_to_weekly:
+                self.logger.info(
+                    "Promoting daily → weekly: %s (ISO week %d-%02d)",
+                    oldest_daily.path.name, oldest_daily.iso_year, oldest_daily.iso_week,
+                )
+                self.move_backup(oldest_daily, self.weekly_dir)
+                weekly_backups.append(oldest_daily)
+                weekly_backups.sort(key=lambda b: b.created_at)
+            else:
+                self.delete_backup(oldest_daily)
+
+        # --- Step 2: Weekly rotation ---
+        # Re-scan weekly after daily promotions (paths may have changed)
         weekly_backups = self.list_backups_in_dir(self.weekly_dir)
 
-        # Rotate weekly → monthly if over limit
+        # Keep weekly backups for the last N weeks. When we have more
+        # weekly backups than our limit, remove the oldest ones.
+        # Before deleting, check if the oldest represents a different month
+        # than the newest monthly — if so, promote it instead.
         while len(weekly_backups) > weekly_limit:
-            oldest = weekly_backups.pop(0)
-            self.move_backup(oldest, self.monthly_dir)
+            oldest_weekly = weekly_backups.pop(0)  # oldest
 
-        # Re-scan monthly after weekly rotation
+            # Should we promote this to monthly?
+            promote_to_monthly = True
+            if monthly_backups:
+                newest_monthly = monthly_backups[-1]  # newest (sorted oldest-first)
+                if not self._is_different_month(oldest_weekly, newest_monthly):
+                    self.logger.info(
+                        "Weekly backup %s is same month (%s) as newest monthly %s — deleting instead of promoting",
+                        oldest_weekly.path.name,
+                        f"{oldest_weekly.created_at.year}-{oldest_weekly.created_at.month:02d}",
+                        newest_monthly.path.name,
+                    )
+                    promote_to_monthly = False
+
+            if promote_to_monthly:
+                self.logger.info(
+                    "Promoting weekly → monthly: %s (month %s)",
+                    oldest_weekly.path.name,
+                    f"{oldest_weekly.created_at.year}-{oldest_weekly.created_at.month:02d}",
+                )
+                self.move_backup(oldest_weekly, self.monthly_dir)
+                monthly_backups.append(oldest_weekly)
+                monthly_backups.sort(key=lambda b: b.created_at)
+            else:
+                self.delete_backup(oldest_weekly)
+
+        # --- Step 3: Monthly retention ---
+        # Re-scan monthly after weekly promotions
         monthly_backups = self.list_backups_in_dir(self.monthly_dir)
 
-        # Apply monthly retention if configured
         if monthly_limit != -1:
+            # Keep only the N most recent monthly backups
             while len(monthly_backups) > monthly_limit:
-                oldest = monthly_backups.pop(0)
-                self.delete_backup(oldest)
+                oldest_monthly = monthly_backups.pop(0)
+                self.delete_backup(oldest_monthly)
 
     def update_latest_symlink(self, latest: Path):
         """Update 'latest.tar.gz' symlink to point to most recent backup."""
@@ -306,22 +459,30 @@ class OpenClawBackup:
         except OSError as e:
             self.logger.error("Failed to update symlink: %s", e)
 
-    def run(self):
-        """Execute full backup workflow with tiered rotation."""
+    def run(self, rotate_only: bool = False):
+        """Execute full backup workflow with tiered rotation.
+
+        Args:
+            rotate_only: If True, skip backup creation and only apply rotation.
+        """
         self.logger.info("=== OpenClaw Backup Manager ===")
 
-        # Step 1: Create new backup (placed in daily/)
-        new_backup_path = self.create_backup()
+        if rotate_only:
+            self.logger.info("Rotation-only mode (skipping backup creation)")
+        else:
+            # Step 1: Create new backup (placed in daily/)
+            new_backup_path = self.create_backup()
 
-        if not new_backup_path:
-            self.logger.error("Backup creation failed, aborting")
-            return 1
+            if not new_backup_path:
+                self.logger.error("Backup creation failed, aborting")
+                return 1
 
         # Step 2: Apply tiered rotation
         self.apply_rotation()
 
-        # Step 3: Update symlink to latest backup
-        self.update_latest_symlink(new_backup_path)
+        if not rotate_only:
+            # Step 3: Update symlink to latest backup
+            self.update_latest_symlink(new_backup_path)
 
         # Step 4: Report final state
         daily_count = len(self.list_backups_in_dir(self.daily_dir))
@@ -369,26 +530,31 @@ def main():
         help="Show what would be done without making changes"
     )
     parser.add_argument(
+        "--rotate-only",
+        action="store_true",
+        help="Only apply rotation to existing backups (skip backup creation)"
+    )
+    parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Enable verbose logging"
     )
-    
+
     args = parser.parse_args()
-    
+
     # Load configuration
     config = load_config(args.config)
-    
+
     # Override with CLI args
     if args.dry_run:
         config["options"]["dry_run"] = True
-    
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    
+
     # Run backup manager
     manager = OpenClawBackup(config)
-    return manager.run()
+    return manager.run(rotate_only=args.rotate_only)
 
 
 if __name__ == "__main__":
