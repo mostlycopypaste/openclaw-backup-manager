@@ -16,7 +16,7 @@ import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
@@ -258,6 +258,28 @@ class OpenClawBackup:
             self.logger.error("Failed to delete %s: %s", backup.path, e)
             return False
 
+    def _promote_or_delete_weekly(self, backup: BackupFile, monthly_backups: List[BackupFile]):
+        """Promote a weekly backup to monthly if its month isn't already represented, else delete."""
+        month_key = backup.year_month
+        existing_months = {b.year_month for b in monthly_backups}
+
+        if month_key not in existing_months:
+            self.logger.info(
+                "Promoting weekly → monthly: %s (month %s)",
+                backup.path.name,
+                f"{backup.created_at.year}-{backup.created_at.month:02d}",
+            )
+            self.move_backup(backup, self.monthly_dir)
+            monthly_backups.append(backup)
+            monthly_backups.sort(key=lambda b: b.created_at)
+        else:
+            self.logger.info(
+                "Weekly backup %s — month %s already in monthly, deleting",
+                backup.path.name,
+                f"{backup.created_at.year}-{backup.created_at.month:02d}",
+            )
+            self.delete_backup(backup)
+
     @staticmethod
     def _is_different_week(backup: BackupFile, reference: BackupFile) -> bool:
         """Check if backup is from a different ISO week than reference.
@@ -400,37 +422,26 @@ class OpenClawBackup:
         # Re-scan weekly after daily promotions (paths may have changed)
         weekly_backups = self.list_backups_in_dir(self.weekly_dir)
 
-        # Keep weekly backups for the last N weeks. When we have more
-        # weekly backups than our limit, remove the oldest ones.
-        # Before deleting, check if the oldest represents a different month
-        # than the newest monthly — if so, promote it instead.
+        # Time-based expiry: weekly backups older than weekly_limit weeks
+        # should be aged out regardless of count. This prevents stale entries
+        # from sitting in weekly indefinitely when daily overflow is slow.
+        now = datetime.now(timezone.utc)
+        max_weekly_age = timedelta(weeks=weekly_limit)
+        expired_weekly = []
+        for b in weekly_backups:
+            created = b.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if (now - created) > max_weekly_age:
+                expired_weekly.append(b)
+        for expired in expired_weekly:
+            weekly_backups.remove(expired)
+            self._promote_or_delete_weekly(expired, monthly_backups)
+
+        # Count-based overflow: if still over limit after expiry, remove oldest.
         while len(weekly_backups) > weekly_limit:
             oldest_weekly = weekly_backups.pop(0)  # oldest
-
-            # Should we promote this to monthly?
-            promote_to_monthly = True
-            if monthly_backups:
-                newest_monthly = monthly_backups[-1]  # newest (sorted oldest-first)
-                if not self._is_different_month(oldest_weekly, newest_monthly):
-                    self.logger.info(
-                        "Weekly backup %s is same month (%s) as newest monthly %s — deleting instead of promoting",
-                        oldest_weekly.path.name,
-                        f"{oldest_weekly.created_at.year}-{oldest_weekly.created_at.month:02d}",
-                        newest_monthly.path.name,
-                    )
-                    promote_to_monthly = False
-
-            if promote_to_monthly:
-                self.logger.info(
-                    "Promoting weekly → monthly: %s (month %s)",
-                    oldest_weekly.path.name,
-                    f"{oldest_weekly.created_at.year}-{oldest_weekly.created_at.month:02d}",
-                )
-                self.move_backup(oldest_weekly, self.monthly_dir)
-                monthly_backups.append(oldest_weekly)
-                monthly_backups.sort(key=lambda b: b.created_at)
-            else:
-                self.delete_backup(oldest_weekly)
+            self._promote_or_delete_weekly(oldest_weekly, monthly_backups)
 
         # --- Step 3: Monthly retention ---
         # Re-scan monthly after weekly promotions

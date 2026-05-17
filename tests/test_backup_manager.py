@@ -5,7 +5,7 @@ Tests for OpenClaw Backup Manager
 
 import sys
 import tempfile
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -395,6 +395,71 @@ class TestRotationLogic:
         assert len(daily) == 0
         assert len(weekly) == 0
         assert len(monthly) == 0
+
+    def test_weekly_time_based_expiry(self, test_config):
+        """Weekly backups older than weekly_limit weeks are aged out regardless of count."""
+        manager = OpenClawBackup(test_config)
+
+        # weekly_limit is 4. Create weekly entries:
+        # - 2 old ones (5+ weeks ago) — should be expired
+        # - 2 recent ones (1-2 weeks ago) — should stay
+        self.create_backup_file(manager.weekly_dir, 40)  # ~5.7 weeks ago
+        self.create_backup_file(manager.weekly_dir, 35)  # 5 weeks ago
+        self.create_backup_file(manager.weekly_dir, 10)  # ~1.4 weeks ago
+        self.create_backup_file(manager.weekly_dir, 3)   # recent
+
+        manager.apply_rotation()
+
+        weekly_backups = manager.list_backups_in_dir(manager.weekly_dir)
+        # Only the 2 recent ones should remain (the old ones expired)
+        assert len(weekly_backups) == 2
+        # Oldest remaining should be ~10 days ago, not 35+
+        for b in weekly_backups:
+            created = b.created_at
+            if created.tzinfo is not None:
+                age = datetime.now(timezone.utc) - created
+            else:
+                age = datetime.now() - created
+            assert age < timedelta(weeks=4), f"Weekly backup {b.path.name} is {age.days} days old, should have been expired"
+
+    def test_expired_weekly_promotes_to_monthly_if_new_month(self, test_config):
+        """Expired weekly backups get promoted to monthly if their month isn't represented."""
+        manager = OpenClawBackup(test_config)
+
+        # Monthly has nothing — expired weekly from a past month should promote
+        self.create_backup_file(manager.weekly_dir, 35)  # 5 weeks ago, different month likely
+        self.create_backup_file(manager.weekly_dir, 3)   # recent
+
+        manager.apply_rotation()
+
+        monthly_backups = manager.list_backups_in_dir(manager.monthly_dir)
+        weekly_backups = manager.list_backups_in_dir(manager.weekly_dir)
+
+        # The old one should have been promoted to monthly
+        assert len(monthly_backups) == 1
+        # Recent one stays in weekly
+        assert len(weekly_backups) == 1
+
+    def test_expired_weekly_deleted_if_month_already_covered(self, test_config):
+        """Expired weekly backups are deleted if monthly already has that month."""
+        manager = OpenClawBackup(test_config)
+
+        # Create a monthly backup from 35 days ago (same month as our weekly)
+        self.create_backup_file(manager.monthly_dir, 37)
+        # Create a weekly backup from 35 days ago (same month, will expire)
+        self.create_backup_file(manager.weekly_dir, 35)
+        # Create a recent weekly
+        self.create_backup_file(manager.weekly_dir, 3)
+
+        manager.apply_rotation()
+
+        monthly_backups = manager.list_backups_in_dir(manager.monthly_dir)
+        weekly_backups = manager.list_backups_in_dir(manager.weekly_dir)
+
+        # Monthly should still have just 1 (no duplicate promotion)
+        assert len(monthly_backups) == 1
+        # Expired weekly was deleted, recent one stays
+        assert len(weekly_backups) == 1
 
 
 class TestSymlinkManagement:
