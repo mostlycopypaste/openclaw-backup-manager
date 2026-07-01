@@ -56,6 +56,16 @@ mkdir -p "${LAUNCH_AGENTS_DIR}"
 
 # Generate plist with absolute paths
 PYTHON3_PATH=$(which python3)
+
+# LaunchAgents run with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) and do
+# NOT inherit the interactive shell environment. Without injecting a usable
+# PATH, the `openclaw` CLI (commonly under NVM/Homebrew/~/.local/bin) is not
+# found and scheduled backups fail silently with exit code 78 (see issue #1).
+# Build a PATH that includes the directory holding `openclaw` plus the current
+# shell PATH so the scheduled job can locate every tool the manual run can.
+OPENCLAW_BIN_DIR=$(dirname "$(command -v openclaw)")
+AGENT_PATH="${OPENCLAW_BIN_DIR}:${PATH}"
+
 cat > "${LAUNCH_AGENTS_DIR}/${PLIST_NAME}" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -71,6 +81,12 @@ cat > "${LAUNCH_AGENTS_DIR}/${PLIST_NAME}" <<EOF
         <string>--config</string>
         <string>${INSTALL_DIR}/config.yaml</string>
     </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>${AGENT_PATH}</string>
+    </dict>
 
     <key>StartCalendarInterval</key>
     <dict>

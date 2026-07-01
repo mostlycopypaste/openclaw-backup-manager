@@ -13,6 +13,20 @@
         <string>/Users/YOUR_USERNAME/.openclaw/backup-manager/config.yaml</string>
     </array>
 
+    <!--
+      LaunchAgents run with a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin) and
+      do NOT inherit your shell environment. The `openclaw` CLI (often installed
+      under NVM, Homebrew, or ~/.local/bin) will not be found unless its
+      directory is on PATH, causing the scheduled backup to fail with exit
+      code 78. Include the directory containing `openclaw` here. The install.sh
+      script generates this automatically from your shell PATH.
+    -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/YOUR_USERNAME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
     <key>StartCalendarInterval</key>
     <dict>
         <key>Hour</key>
