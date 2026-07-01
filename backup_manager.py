@@ -13,6 +13,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -47,6 +48,100 @@ DEFAULT_CONFIG = {
         "keep_latest_symlink": True,
     },
 }
+
+
+def _nvm_version_sort_key(path: Path):
+    """Sort key that orders NVM node dirs newest-first by semantic version.
+
+    Directory names look like ``v24.14.0``. Falls back to a string compare for
+    anything that doesn't parse cleanly so we never raise while scanning.
+    """
+    name = path.name.lstrip("v")
+    parts = []
+    for chunk in name.split("."):
+        try:
+            parts.append(int(chunk))
+        except ValueError:
+            parts.append(-1)
+    return tuple(parts)
+
+
+def _resolve_nvm_openclaw() -> Optional[Path]:
+    """Locate `openclaw` inside the *current* NVM node install, if any.
+
+    NVM installs each Node version under
+    ``$NVM_DIR/versions/node/<version>/bin`` and CLIs installed globally land
+    in that same bin dir. Pinning a single version path (as the old LaunchAgent
+    did) breaks the moment Node is upgraded. Instead we resolve dynamically:
+
+      1. Honor the ``default`` alias if it points at an installed version that
+         still has ``openclaw``.
+      2. Otherwise fall back to the newest installed version that has it.
+
+    Returns the resolved executable path, or ``None`` if NVM/openclaw absent.
+    """
+    nvm_dir = Path(os.environ.get("NVM_DIR") or (Path.home() / ".nvm"))
+    versions_dir = nvm_dir / "versions" / "node"
+    if not versions_dir.is_dir():
+        return None
+
+    # 1. Prefer the version referenced by the `default` alias.
+    alias_file = nvm_dir / "alias" / "default"
+    if alias_file.is_file():
+        try:
+            alias = alias_file.read_text().strip()
+        except OSError:
+            alias = ""
+        if alias:
+            exact = versions_dir / alias / "bin" / "openclaw"
+            if exact.exists():
+                return exact
+            # Alias may be a prefix (e.g. "24" or "v24") — match newest.
+            prefix = alias if alias.startswith("v") else f"v{alias}"
+            matches = [d for d in versions_dir.glob(f"{prefix}*") if d.is_dir()]
+            for version_dir in sorted(matches, key=_nvm_version_sort_key, reverse=True):
+                exe = version_dir / "bin" / "openclaw"
+                if exe.exists():
+                    return exe
+
+    # 2. Fall back to the newest installed version that ships openclaw.
+    version_dirs = [d for d in versions_dir.glob("v*") if d.is_dir()]
+    for version_dir in sorted(version_dirs, key=_nvm_version_sort_key, reverse=True):
+        exe = version_dir / "bin" / "openclaw"
+        if exe.exists():
+            return exe
+
+    return None
+
+
+def resolve_openclaw_path(config: dict) -> str:
+    """Resolve the `openclaw` executable to use, resilient to Node upgrades.
+
+    Resolution order:
+      1. An explicit ``openclaw_path`` in config, *if* it still exists and is
+         executable. A configured-but-missing path (e.g. a stale, version-
+         pinned NVM path — issue #2) is intentionally ignored so we can
+         re-resolve dynamically instead of dying with FileNotFoundError.
+      2. Whatever ``openclaw`` is on PATH.
+      3. A dynamic NVM lookup of the current node version's ``openclaw``.
+      4. The bare name ``openclaw`` as a last resort (yields a clear error).
+    """
+    configured = config.get("openclaw_path")
+    if configured and configured != "openclaw":
+        candidate = Path(configured).expanduser()
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        # Stale/pinned path — fall through to dynamic resolution.
+
+    on_path = shutil.which("openclaw")
+    if on_path:
+        return on_path
+
+    nvm_openclaw = _resolve_nvm_openclaw()
+    if nvm_openclaw:
+        return str(nvm_openclaw)
+
+    return configured or "openclaw"
 
 
 @dataclass
@@ -102,8 +197,9 @@ class OpenClawBackup:
         self.output_dir = Path(config["backup"]["output_dir"]).expanduser()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Get openclaw path from config, default to 'openclaw' in PATH
-        self.openclaw_path = config.get("openclaw_path", "openclaw")
+        # Resolve the openclaw executable dynamically so a Node/NVM version
+        # change doesn't break scheduled runs (issue #2).
+        self.openclaw_path = resolve_openclaw_path(config)
 
         # Create tiered subdirectories
         self.daily_dir = self.output_dir / "daily"
@@ -129,6 +225,7 @@ class OpenClawBackup:
     def create_backup(self) -> Optional[Path]:
         """Run openclaw backup create and move to daily/ directory."""
         self.logger.info("Starting backup creation...")
+        self.logger.info("Using openclaw executable: %s", self.openclaw_path)
 
         cmd = [
             self.openclaw_path, "backup", "create",
